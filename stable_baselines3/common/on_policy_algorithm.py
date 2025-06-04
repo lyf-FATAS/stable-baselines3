@@ -1,6 +1,7 @@
 import sys
 import time
 import warnings
+from loguru import logger
 from typing import Any, Optional, TypeVar, Union
 
 import numpy as np
@@ -191,16 +192,24 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
         callback.on_rollout_start()
 
+        self.t_compute_actions, self.t_to_cpu, self.t_step_env = 0.0, 0.0, 0.0
         while n_steps < n_rollout_steps:
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
 
+            start_compute_actions = time.perf_counter()
             with th.no_grad():
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 actions, values, log_probs = self.policy(obs_tensor)
+                end_compute_actions = time.perf_counter()
+                self.t_compute_actions += end_compute_actions - start_compute_actions
+
+            start_ = time.perf_counter()
             actions = actions.cpu().numpy()
+            end_ = time.perf_counter()
+            self.t_to_cpu += end_ - start_
 
             # Rescale and perform action
             clipped_actions = actions
@@ -215,7 +224,10 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                     # as we are sampling from an unbounded Gaussian distribution
                     clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
+            start_step_env = time.perf_counter()
             new_obs, rewards, dones, infos = env.step(clipped_actions)
+            end_step_env = time.perf_counter()
+            self.t_step_env += end_step_env - start_step_env
 
             self.num_timesteps += env.num_envs
 
@@ -320,7 +332,12 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
         assert self.env is not None
 
+        sim_real_time_ratio_avg = None
+        num_iter = 0
         while self.num_timesteps < total_timesteps:
+            num_iter += 1
+            start_iteration = time.perf_counter()
+
             continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
 
             if not continue_training:
@@ -334,7 +351,28 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 assert self.ep_info_buffer is not None
                 self.dump_logs(iteration)
 
+            start_update = time.perf_counter()
             self.train()
+            end_update = time.perf_counter()
+            t_update = end_update - start_update
+
+            # Runtime report
+            end_iteration = time.perf_counter()
+            t_iteration = end_iteration - start_iteration
+            t_iteration_sim = self.env.unwrapped.step_dt * self.n_steps
+            if sim_real_time_ratio_avg is None:
+                sim_real_time_ratio_avg = t_iteration_sim / t_iteration
+            else:
+                sim_real_time_ratio = t_iteration_sim / t_iteration
+                sim_real_time_ratio_avg = (sim_real_time_ratio_avg * (num_iter - 1) + sim_real_time_ratio) / num_iter
+
+            logger.info(f"Learning iteration takes {t_iteration:.5f}s")
+            logger.info(f">>> Compute actions takes up {self.t_compute_actions / t_iteration * 100:.2f}%")
+            logger.info(f">>> Actions to cpu takes up {self.t_to_cpu / t_iteration * 100:.2f}%")
+            logger.info(f">>> Step envs takes up {self.t_step_env / t_iteration * 100:.2f}%, {self.t_step_env / self.n_steps:.5f}s / step")
+            logger.info(f">>> Update takes up {t_update / t_iteration * 100:.2f}%, {t_update:.5f}s")
+            logger.info(f"Sim time passes {sim_real_time_ratio_avg:.2f} times faster than real time")
+            logger.info("\n\n\n\n=========================================================================================================================================\n===================================================== Training Iteration Split Line =====================================================\n=========================================================================================================================================")
 
         callback.on_training_end()
 
